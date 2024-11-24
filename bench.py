@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 
 """
-Transformer Operation Benchmarking Script for A10 GPU
+Transformer Operation Benchmarking Script for Multiple GPUs
 
-This script benchmarks various transformer operations on A10 GPU including:
+This script benchmarks various transformer operations on different GPU types including:
+- NVIDIA RTX 3090 (24GB GDDR6X)
+- NVIDIA A10 (24GB GDDR6)
+- NVIDIA H100 (80GB HBM3)
+
+Operations benchmarked:
 1. Dense matrix multiplication
 2. Query-Key attention (initialization phase)
 3. Query-Key attention (auto-regressive phase)
-
-Optimized for A10's features:
-- ~24GB GDDR6 memory
-- Appropriate memory bandwidth
-- FP16 precision support
 """
 
 import os
@@ -24,14 +24,42 @@ import gzip
 from datetime import datetime
 from tqdm.auto import tqdm
 import torch
+import argparse
 
 # Disable gradient computation for benchmarking
 torch.set_grad_enabled(False)
+
+# GPU configurations
+GPU_CONFIGS = {
+    "3090": {
+        "memory": 24e9,  # 24GB GDDR6X
+        "name": "RTX 3090",
+        "precision": "fp16"
+    },
+    "a10": {
+        "memory": 24e9,  # 24GB GDDR6
+        "name": "A10",
+        "precision": "fp16"
+    },
+    "h100": {
+        "memory": 80e9,  # 80GB HBM3
+        "name": "H100",
+        "precision": "fp16"
+    }
+}
 
 # Benchmark configurations
 ND_LIST = list(itertools.chain(itertools.product([12, 16, 32], [64]), itertools.product([32, 40, 56, 72, 96], [128])))
 SEQLEN_LIST = [10, 20, 50, 100, 200, 500, 1000, 2000, 4000, 5000]
 BS_LIST = list(itertools.chain(range(1, 8), range(8, 16, 2), range(16, 32, 4), range(32, 64, 8), range(64, 128, 16), [128]))
+
+def get_available_gpu():
+    """
+    Find and return the first available CUDA GPU.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("No CUDA GPUs available")
+    return torch.device(f"cuda:0")
 
 def benchmark(f, *, f_setup=None, min_repeat: int, min_secs: float, tqdm_kwargs: dict | None=None) -> np.ndarray:
     """
@@ -66,10 +94,12 @@ def tail_mean(xs, skip=0.2):
     """Calculate mean of array after skipping initial portion."""
     return xs[int(len(xs) * skip):].mean()
 
-def benchmark_dense(out, nd_list, seqlen_list, bs_list):
+def benchmark_dense(out, nd_list, seqlen_list, bs_list, gpu_config):
     """
-    Benchmark dense matrix multiplication operations using FP16.
+    Benchmark dense matrix multiplication operations using specified precision.
     """
+    device = get_available_gpu()
+    memory_limit = gpu_config["memory"]
     seqlen_list = [1] + seqlen_list
     total = len(list(itertools.product(nd_list, seqlen_list, bs_list)))
     pbar = tqdm(total=total)
@@ -77,15 +107,14 @@ def benchmark_dense(out, nd_list, seqlen_list, bs_list):
     for (n, d), seqlen in reversed(list(itertools.product(nd_list, seqlen_list))):
         h = n * d
         try:
-            maxbs = max(b for b in bs_list if b*seqlen*h*2 + h*h*2 + b*seqlen*h*2 < 24e9)
+            maxbs = max(b for b in bs_list if b*seqlen*h*2 + h*h*2 + b*seqlen*h*2 < memory_limit)
         except ValueError:
             pbar.update(len(bs_list))
             continue
             
-        cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda:0")
-        
-        X = torch.rand((maxbs, seqlen, h), dtype=torch.float16, device="cuda:0")
-        W = torch.rand((h, h), dtype=torch.float16, device="cuda:0")
+        cache = torch.empty(int(256e6 // 4), dtype=torch.int, device=device)
+        X = torch.rand((maxbs, seqlen, h), dtype=torch.float16, device=device)
+        W = torch.rand((h, h), dtype=torch.float16, device=device)
             
         torch.cuda.synchronize()
         for bs in reversed(bs_list):
@@ -116,25 +145,27 @@ def benchmark_dense(out, nd_list, seqlen_list, bs_list):
         torch.cuda.empty_cache()
     pbar.close()
 
-def benchmark_qk_init(out, nd_list, seqlen_list, bs_list):
+def benchmark_qk_init(out, nd_list, seqlen_list, bs_list, gpu_config):
     """
     Benchmark Query-Key attention initialization.
-    Optimized for A10's memory capacity.
     """
+    device = get_available_gpu()
+    memory_limit = gpu_config["memory"]
     total = len(list(itertools.product(nd_list, seqlen_list, bs_list)))
     pbar = tqdm(total=total)
+    
     for (n, d), seqlen in reversed(list(itertools.product(nd_list, seqlen_list))):
         h = n * d
         try:
-            # Adjusted memory limit for A10 (~24GB)
-            maxbs = max(b for b in bs_list if b*n*seqlen*d*2*2+b*n*seqlen**2*2 < 24e9)
+            maxbs = max(b for b in bs_list if b*n*seqlen*d*2*2+b*n*seqlen**2*2 < memory_limit)
         except ValueError:
             pbar.update(len(bs_list))
             continue
             
-        cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda:0")
-        Qmax = torch.rand((maxbs, n, seqlen, d), dtype=torch.float16, device="cuda:0")
-        Kmax = torch.rand((maxbs, n, seqlen, d), dtype=torch.float16, device="cuda:0")
+        cache = torch.empty(int(256e6 // 4), dtype=torch.int, device=device)
+        Qmax = torch.rand((maxbs, n, seqlen, d), dtype=torch.float16, device=device)
+        Kmax = torch.rand((maxbs, n, seqlen, d), dtype=torch.float16, device=device)
+            
         torch.cuda.synchronize()
         for bs in reversed(bs_list):
             pbar.set_postfix(n=n, h=h, d=d, seqlen=seqlen, bs=bs)
@@ -164,27 +195,26 @@ def benchmark_qk_init(out, nd_list, seqlen_list, bs_list):
         torch.cuda.empty_cache()
     pbar.close()
 
-def benchmark_qk_ar(out, nd_list, seqlen_list, bs_list):
+def benchmark_qk_ar(out, nd_list, seqlen_list, bs_list, gpu_config):
     """
     Benchmark Query-Key attention in auto-regressive mode.
-    Optimized for A10 capabilities.
     """
+    device = get_available_gpu()
+    memory_limit = gpu_config["memory"]
     total = len(list(itertools.product(nd_list, seqlen_list, bs_list)))
     pbar = tqdm(total=total)
+    
     for (n, d), seqlen in reversed(list(itertools.product(nd_list, seqlen_list))):
         h = n * d
         try:
-            # Adjusted memory limit for A10
-            maxbs = max(b for b in bs_list if b*n*(1+seqlen)*d*2+b*n*seqlen*2 < 24e9)
+            maxbs = max(b for b in bs_list if b*n*(1+seqlen)*d*2+b*n*seqlen*2 < memory_limit)
         except ValueError:
             pbar.update(len(bs_list))
             continue
             
-        cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda:0")
-        
-        # Use FP16 for all computations
-        Qmax = torch.rand((maxbs, n, 1, d), dtype=torch.float16, device="cuda:0")
-        Kmax = torch.rand((maxbs, n, seqlen, d), dtype=torch.float16, device="cuda:0")
+        cache = torch.empty(int(256e6 // 4), dtype=torch.int, device=device)
+        Qmax = torch.rand((maxbs, n, 1, d), dtype=torch.float16, device=device)
+        Kmax = torch.rand((maxbs, n, seqlen, d), dtype=torch.float16, device=device)
             
         torch.cuda.synchronize()
         
@@ -220,7 +250,7 @@ def benchmark_qk_ar(out, nd_list, seqlen_list, bs_list):
         torch.cuda.empty_cache()
     pbar.close()
 
-def process_results(data):
+def process_results(data, gpu_config):
     """Process benchmark results and save as CSV."""
     df_dense = (
         pd.DataFrame.from_dict(data["dense"])
@@ -250,60 +280,104 @@ def process_results(data):
         .assign(series="qk_ar")
     )
     
-    # Add A10-specific metrics
+    # Add GPU-specific metrics
     for df in [df_dense, df_qk_init, df_qk_ar]:
-        df['gpu'] = 'A10'
-        df['precision'] = 'fp16'
+        df['gpu'] = gpu_config["name"]
+        df['precision'] = gpu_config["precision"]
 
     # Combine and save all results
     timestamp = datetime.now().strftime("%Y%m%d")
+    gpu_name = gpu_config["name"].lower().replace(" ", "-")
     pd.concat([df_dense, df_qk_init, df_qk_ar]).to_csv(
-        f"data/transformer-batching-microbenchmarks-a10-fp16-{timestamp}.csv", 
+        f"data/transformer-batching-microbenchmarks-{gpu_name}-{gpu_config['precision']}-{timestamp}.csv", 
         index=False
     )
 
-def main():
+def main(gpu_type):
+    gpu_config = GPU_CONFIGS[gpu_type.lower()]
+    
     # Run benchmarks
     data = {}
     
-    print("Running Query-Key initialization benchmarks...")
+    print(f"\nRunning benchmarks on {gpu_config['name']}...")
+    print(f"Memory limit: {gpu_config['memory']/1e9:.1f}GB")
+    print(f"Using {gpu_config['precision']} precision")
+    
+    print("\nRunning Query-Key initialization benchmarks...")
     db = []
-    benchmark_qk_init(db, ND_LIST, SEQLEN_LIST, BS_LIST)
+    benchmark_qk_init(db, ND_LIST, SEQLEN_LIST, BS_LIST, gpu_config)
     data["qk_init"] = db
 
-    print("Running Query-Key auto-regressive benchmarks...")
+    print("\nRunning Query-Key auto-regressive benchmarks...")
     db = []
-    benchmark_qk_ar(db, ND_LIST, SEQLEN_LIST, BS_LIST)
+    benchmark_qk_ar(db, ND_LIST, SEQLEN_LIST, BS_LIST, gpu_config)
     data["qk_ar"] = db
 
-    print("Running dense operation benchmarks...")
+    print("\nRunning dense operation benchmarks...")
     db = []
-    benchmark_dense(db, ND_LIST, SEQLEN_LIST, BS_LIST)
+    benchmark_dense(db, ND_LIST, SEQLEN_LIST, BS_LIST, gpu_config)
     data["dense"] = db
 
     # Save benchmark results
     timestamp = datetime.now().strftime("%Y%m%d")
-    with gzip.open(f"data/{timestamp}-transformer-batching-a10-fp16.pkl.gz", "wb") as f:
+    gpu_name = gpu_config["name"].lower().replace(" ", "-")
+    with gzip.open(f"data/{timestamp}-transformer-batching-{gpu_name}-{gpu_config['precision']}.pkl.gz", "wb") as f:
         pickle.dump(data, f)
 
     # Process and save results as CSV
-    process_results(data)
+    process_results(data, gpu_config)
 
 if __name__ == "__main__":
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description='Transformer operation benchmarking across multiple GPU types')
+    parser.add_argument('--gpu', type=str, choices=['3090', 'a10', 'h100'], 
+                      help='GPU type to benchmark (3090, a10, or h100)')
+    parser.add_argument('--all', action='store_true', 
+                      help='Run benchmarks on all available GPU types')
+    parser.add_argument('--custom-memory', type=float,
+                      help='Override default GPU memory limit in GB (optional)')
+    args = parser.parse_args()
+
     # Create data directory if it doesn't exist
     os.makedirs("data", exist_ok=True)
     
-    # Print configuration and A10-specific information
-    print("Starting transformer benchmarking on A10 GPU...")
-    print("\nA10 Specific Features:")
-    print("- Using FP16 precision for all operations")
-    print("- Memory capacity: ~24GB GDDR6")
-    print("- Optimized for A10 memory bandwidth")
-    
+    # Print available GPU information
+    if torch.cuda.is_available():
+        print(f"Available GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
+    else:
+        raise RuntimeError("No CUDA GPU available for benchmarking")
+
+    # Handle custom memory limit
+    if args.custom_memory:
+        for gpu in GPU_CONFIGS:
+            GPU_CONFIGS[gpu]["memory"] = args.custom_memory * 1e9
+        print(f"\nUsing custom memory limit: {args.custom_memory}GB")
+
+    # Print configuration
     print("\nBenchmarking configurations:")
     print("- Model configurations:", ND_LIST)
     print("- Sequence lengths:", SEQLEN_LIST)
     print("- Batch sizes:", BS_LIST)
-    
-    # Run main benchmark suite
-    main()
+
+    if args.all:
+        # Run benchmarks for all GPU types
+        for gpu_type in GPU_CONFIGS:
+            try:
+                print(f"\n{'='*50}")
+                print(f"Starting benchmarks for {GPU_CONFIGS[gpu_type]['name']}")
+                print(f"{'='*50}")
+                main(gpu_type)
+            except Exception as e:
+                print(f"Error running benchmarks for {gpu_type}: {str(e)}")
+                continue
+    elif args.gpu:
+        # Run benchmarks for specified GPU type
+        if args.gpu.lower() not in GPU_CONFIGS:
+            print(f"Error: Unsupported GPU type '{args.gpu}'")
+            print(f"Supported GPUs: {list(GPU_CONFIGS.keys())}")
+            exit(1)
+        main(args.gpu)
+    else:
+        parser.print_help()
+        exit(1)
