@@ -76,15 +76,23 @@ def benchmark_dense(out, nd_list, seqlen_list, bs_list):
     
     for (n, d), seqlen in reversed(list(itertools.product(nd_list, seqlen_list))):
         h = n * d
-        maxbs = max(bs_list)
+        try:
+            maxbs = max(b for b in bs_list if b*seqlen*h*2 + h*h*2 + b*seqlen*h*2 < 24e9)
+        except ValueError:
+            pbar.update(len(bs_list))
+            continue
+            
         cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda:0")
         
-        # Use FP16 for all computations
         X = torch.rand((maxbs, seqlen, h), dtype=torch.float16, device="cuda:0")
         W = torch.rand((h, h), dtype=torch.float16, device="cuda:0")
             
         torch.cuda.synchronize()
         for bs in reversed(bs_list):
+            if bs > maxbs:
+                pbar.update()
+                continue
+                
             pbar.set_postfix(n=n, h=h, d=d, seqlen=seqlen, bs=bs)
             def run():
                 torch.matmul(X[:bs], W)
@@ -167,7 +175,7 @@ def benchmark_qk_ar(out, nd_list, seqlen_list, bs_list):
         h = n * d
         try:
             # Adjusted memory limit for A10
-            maxbs = max(b for b in bs_list if b*n*(1+seqlen)*d*2+b*n*seqlen*2 < 48e9)
+            maxbs = max(b for b in bs_list if b*n*(1+seqlen)*d*2+b*n*seqlen*2 < 24e9)
         except ValueError:
             pbar.update(len(bs_list))
             continue
