@@ -183,7 +183,6 @@ def benchmark_qk_init(out, nd_list, seqlen_list, bs_list, gpu_config, dtype_name
     for (n, d), seqlen in reversed(list(itertools.product(nd_list, seqlen_list))):
         h = n * d
         try:
-            # maxbs = max(b for b in bs_list if b*n*seqlen*d*2*2+b*n*seqlen**2*2 < memory_limit)
             maxbs = max(b for b in bs_list if (b*n*seqlen*d*2 + b*n*seqlen**2) * bytes_per_elem < memory_limit)
         except ValueError:
             pbar.update(len(bs_list))
@@ -237,7 +236,6 @@ def benchmark_qk_ar(out, nd_list, seqlen_list, bs_list, gpu_config, dtype_name):
     for (n, d), seqlen in reversed(list(itertools.product(nd_list, seqlen_list))):
         h = n * d
         try:
-            # maxbs = max(b for b in bs_list if b*n*(1+seqlen)*d*2+b*n*seqlen*2 < memory_limit)
             maxbs = max(b for b in bs_list if (b*n*(1+seqlen)*d + b*n*seqlen) * bytes_per_elem < memory_limit)
         except ValueError:
             pbar.update(len(bs_list))
@@ -286,11 +284,13 @@ def process_results(data, gpu_config):
     """Process benchmark results and save as CSV."""
     results = []
     for dtype_name in data:
+        bytes_per_elem = DTYPE_SIZES[dtype_name]
+        
         df_dense = (
             pd.DataFrame.from_dict(data[dtype_name]["dense"])
             .assign(h=lambda x: x["n"] * x["d"])
             .assign(flop=lambda x: (x["bs"] * x["seqlen"] * x["h"]**2) * 2)
-            .assign(io=lambda x: (x["bs"]*x["seqlen"]*x["h"]*2 + x["h"]**2) * 2)
+            .assign(io=lambda x: (x["bs"]*x["seqlen"]*x["h"]*2 + x["h"]**2) * bytes_per_elem)
             .assign(intensity=lambda x: x["flop"] / x["io"])
             .assign(throughput=lambda x: x["bs"]*x["seqlen"] / x["latency"])
             .assign(series="dense")
@@ -301,7 +301,7 @@ def process_results(data, gpu_config):
             pd.DataFrame.from_dict(data[dtype_name]["qk_init"])
             .assign(h=lambda x: x["n"] * x["d"])
             .assign(flop=lambda x: (x["bs"]*x["n"]*x["d"]*x["seqlen"]**2) * 2)
-            .assign(io=lambda x: (x["bs"]*x["n"]*(x["seqlen"]*x["d"]*2 + x["seqlen"]**2)) * 2)
+            .assign(io=lambda x: (x["bs"]*x["n"]*(x["seqlen"]*x["d"]*2 + x["seqlen"]**2)) * bytes_per_elem)
             .assign(intensity=lambda x: x["flop"] / x["io"])
             .assign(throughput=lambda x: x["bs"]*x["seqlen"] / x["latency"])
             .assign(series="qk_init")
@@ -312,7 +312,7 @@ def process_results(data, gpu_config):
             pd.DataFrame.from_dict(data[dtype_name]["qk_ar"])
             .assign(h=lambda x: x["n"] * x["d"])
             .assign(flop=lambda x: (x["bs"]*x["n"]*x["d"]*x["seqlen"]) * 2)
-            .assign(io=lambda x: (x["bs"]*x["n"]*(x["d"] + x["seqlen"]*x["d"] + x["seqlen"])) * 2)
+            .assign(io=lambda x: (x["bs"]*x["n"]*(x["d"] + x["seqlen"]*x["d"] + x["seqlen"])) * bytes_per_elem)
             .assign(intensity=lambda x: x["flop"] / x["io"])
             .assign(throughput=lambda x: x["bs"] / x["latency"])
             .assign(series="qk_ar")
